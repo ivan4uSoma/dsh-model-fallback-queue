@@ -1042,23 +1042,18 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
   }
 }
 
-// ================= 场景 H：跨路由适配（wl 补丁，2026-11-11）=================
-// 真机故障两条，都由「P1 失败 → 换到另一个 provider」触发：
-//  1) DeepSeek 会话（P1 默认 maxTokens=256000）切到 zai/glm-5.3，子请求仍带
-//     maxTokens=256000 → z.ai 400 code 1210「限制数值范围[1,131072]」。
-//  2) GLM 会话（P1=zai）切到 deepseek-official：历史 assistant 消息的 thinking
-//     跨适配器带不过去，而 DeepSeek Anthropic 端点要求「text + tool_use」的
-//     assistant 消息必须带 thinking 块 → 400「content[].thinking ... passed back」。
-// 补丁语义：换路由时剥 maxTokens/reasoningEffort；对 strict provider 摘掉
-// 无法重放 thinking 的 tool-call assistant 消息的 text 块（tool-call 保留）。
+// ================= 场景 H：跨路由控制字段与切换政策（wl 补丁, wl.3）=================
+// 真实故障（2026-11-11/12）：
+//  1) DeepSeek 会话（P1 maxTokens=256000）切到 zai/glm-5.3，子请求仍带 256000
+//     → z.ai 400 code 1210「限制数值范围[1,131072]」。Патч: при смене маршрута
+//     снимаются maxTokens/reasoningEffort.
+//  2) GLM-сессия уехала в deepseek-official: DeepSeek требует возвращать thinking
+//     у tool-call-ходов, чужая история его не имеет → 400 content[].thinking.
+//     Патч wl.3: при истории инструментов переход на другого провайдера запрещён.
 {
   const xllm = makeLlm();
   const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, xllm);
-  mod.apply(ctx, {
-    enabled: true,
-    strictThinkingProviders: ['deepseek-official'],
-    nativeReplayKinds: ['deepseek-official=deepseek-messages'],
-  });
+  mod.apply(ctx, { enabled: true });
   await new Promise((r) => setTimeout(r, 80));
   const svc = ctx.__service;
   if (svc && hooks['llm/stream']) {
@@ -1088,74 +1083,69 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
   }
 }
 
-// 场景 H-2：GLM 会话 → DeepSeek 的历史适配。单独的 ctx：路由器有全局会话模型快照，
-// 同一实例里跨用例会互相污染（P1 会沿用上一个用例记下的模型）。
+// 场景 H-2：история с инструментами — переход на другого провайдера запрещён.
+// Именно этот кейс стрелял в бою 12.11 01:37 (b2b, шаг 111).
 {
-  const yllm = makeLlm();
-  const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, yllm);
-  mod.apply(ctx, {
-    enabled: true,
-    strictThinkingProviders: ['deepseek-official'],
-    nativeReplayKinds: ['deepseek-official=deepseek-messages'],
-  });
+  const zllm = makeLlm();
+  const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, zllm);
+  mod.apply(ctx, { enabled: true });
   await new Promise((r) => setTimeout(r, 80));
   const svc = ctx.__service;
   if (svc && hooks['llm/stream']) {
     const collect = async (options) => {
-      const it = hooks['llm/stream'](options, () => yllm.stream(options));
+      const it = hooks['llm/stream'](options, () => zllm.stream(options));
       const arr = [];
       for await (const c of it) arr.push(c);
       return arr;
     };
-    // ---- P1=zai/auth（失败）→ 队列 deepseek-official/good（成功）----
     await svc.setQueue([{ provider: 'deepseek-official', model: 'good' }]);
-    const foreignAssistant = {
-      role: 'assistant',
-      content: [
-        { type: 'reasoning', text: 'думаю' },
-        { type: 'text', text: 'сейчас вызову тул' },
-        { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
-      ],
-      source: { kind: 'model', provider: 'zai', model: 'glm-5.3', replayState: { response: { kind: 'pi-ai' } } },
-    };
-    const nativeAssistant = {
-      role: 'assistant',
-      content: [
-        { type: 'reasoning', text: 'думаю' },
-        { type: 'text', text: 'нативный шаг' },
-        { type: 'tool-call', id: 'c2', name: 'bash', arguments: '{}' },
-      ],
-      source: { kind: 'model', provider: 'deepseek-official', model: 'good', replayState: { response: { kind: 'deepseek-messages' } } },
-    };
     const messages = [
       { role: 'user', content: [{ type: 'text', text: 'hi' }] },
-      foreignAssistant,
-      nativeAssistant,
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'думаю' },
+          { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: 'zai', model: 'auth', replayState: { response: { kind: 'pi-ai' } } },
+      },
+      { role: 'tool', content: [{ type: 'text', text: 'ok' }], toolCallId: 'c1' },
     ];
-    yllm.calls.length = 0;
-    yllm.reqs.length = 0;
-    await collect({
-      sessionId: 'sess-wl-history',
-      provider: 'zai',
-      model: 'auth',
-      reasoningEffort: 'high',
-      messages,
-    });
-    ok('wl：z.ai 失败后换到 deepseek（而不是原地报错）', yllm.calls[0] === 'zai/auth' && yllm.calls[1] === 'deepseek-official/good', yllm.calls.join(','));
-    const sentMessages = yllm.reqs[1]?.messages || [];
-    ok(
-      'wl：跨适配器 assistant（text+tool_use）摘掉 text，tool-call 保留',
-      Array.isArray(sentMessages[1]?.content)
-        && sentMessages[1].content.every((b) => b.type !== 'text')
-        && sentMessages[1].content.some((b) => b.type === 'tool-call'),
-      JSON.stringify((sentMessages[1]?.content || []).map((b) => b.type)),
-    );
-    ok(
-      'wl：原生的 DeepSeek assistant 消息不被改写',
-      Array.isArray(sentMessages[2]?.content) && sentMessages[2].content.some((b) => b.type === 'text') && sentMessages[2].content.length === 3,
-      JSON.stringify((sentMessages[2]?.content || []).map((b) => b.type)),
-    );
-    ok('wl：会话历史本身没有被改写（只改下发的副本）', messages[1].content.length === 3);
+    zllm.calls.length = 0;
+    zllm.reqs.length = 0;
+    await collect({ sessionId: 'sess-wl-tools', provider: 'zai', model: 'auth', messages });
+    ok('H-2: при истории инструментов чужой провайдер не пробуется',
+      zllm.calls.length === 1 && zllm.calls[0] === 'zai/auth', zllm.calls.join(','));
+    ok('H-2: история не переписывается (никакой «адаптации» блоков)',
+      zllm.reqs[0]?.messages === messages || (zllm.reqs[0]?.messages?.[1]?.content?.length === 2),
+      JSON.stringify((zllm.reqs[0]?.messages?.[1]?.content || []).map((b) => b.type)));
+  }
+}
+
+// 场景 H-3：без истории инструментов переход разрешён (начало сессии).
+{
+  const wllm = makeLlm();
+  const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, wllm);
+  mod.apply(ctx, { enabled: true });
+  await new Promise((r) => setTimeout(r, 80));
+  const svc = ctx.__service;
+  if (svc && hooks['llm/stream']) {
+    const collect = async (options) => {
+      const it = hooks['llm/stream'](options, () => wllm.stream(options));
+      const arr = [];
+      for await (const c of it) arr.push(c);
+      return arr;
+    };
+    await svc.setQueue([{ provider: 'deepseek-official', model: 'good' }]);
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      { role: 'assistant', content: [{ type: 'reasoning', text: 'думаю' }, { type: 'text', text: 'ок' }] },
+    ];
+    wllm.calls.length = 0;
+    wllm.reqs.length = 0;
+    await collect({ sessionId: 'sess-wl-plain', provider: 'zai', model: 'auth', messages });
+    ok('H-3: без инструментов переход на другого провайдера работает',
+      wllm.calls[0] === 'zai/auth' && wllm.calls[1] === 'deepseek-official/good', wllm.calls.join(','));
   }
 }
 
