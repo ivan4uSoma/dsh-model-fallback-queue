@@ -72,9 +72,11 @@ const DEFAULT_CONFIG = {
   probeConcurrency: 4,
   // 「探测完成」逐条状态在快照里保留多久（毫秒），到点自动清空/淡出。
   probeStatusTtlMs: 4000,
-  // Кросс-провайдерный резерв идёт без thinking: у DeepSeek thinking у tool-call-ходов
-  // нужно вернуть, а чужой (GLM) истории нечего вернуть — сервис пробует восстановить
-  // по id инструментов и падает 400. См. routeCallOptions / withoutReasoning.
+  // Кому добивать thinking-заглушкой ходы с tool_use без рассуждений: DeepSeek
+  // (Anthropic-эндпоинт) требует thinking у каждого такого хода, но входную сигнатуру
+  // не валидирует — значит для чужих ходов без рассуждений достаточно заглушки.
+  // См. withThinkingPassback.
+  thinkingPassbackProviders: ['deepseek-official'],
 };
 
 /** settings 里不允许出现的键：queue 已迁到 state 文件 */
@@ -290,30 +292,42 @@ function withRouteOverride(cfg, route) {
   return { ...rest, provider: route.provider, model: route.model };
 }
 
+/** Нормализованный список провайдеров из конфига (не-строки игнорируются). */
+function providerList(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.length > 0) : [];
+}
+
 /**
- * История без reasoning-блоков — для запроса на другого провайдера.
+ * Шаг с инструментом без рассуждений получает thinking-заглушку.
  *
- * Чужое reasoning некуда деть: у DeepSeek thinking-блок обязан вернуться вместе с
- * tool-call-ходом, а подпись и содержание GLM для него не свои. Поэтому в резервном
- * запросе reasoning не передаём вовсе, а сам запрос идёт без thinking (см.
- * routeCallOptions) — это обычный tool-loop, который принимают оба провайдера.
+ * Почему это законно: DeepSeek (Anthropic-эндпоинт) требует, чтобы у каждого
+ * assistant-хода с tool_use был thinking-блок, но **входную сигнатуру не валидирует**
+ * (док: «the input signature is not validated», api-docs.deepseek.com/api/create-message).
+ * Отсутствие блока он пробует восстановить по tool-call id, а у чужой истории это
+ * не выходит → 400 `content[].thinking`. Поэтому там, где своего thinking нет,
+ * кладём минимальную заглушку: наличие блока проверку закрывает, содержимое не
+ * искажает (это пробел, а не выдуманное рассуждение).
+ *
+ * Своё (уже имеющееся) reasoning НЕ трогаем — оно уходит как есть, качество сохраняется.
  *
  * @param {Array<object>} messages сообщения harness-запроса
- * @returns {Array<object>} тот же массив, если reasoning нет, иначе копия без них
+ * @returns {Array<object>} тот же массив, если править нечего, иначе копия
  */
-function withoutReasoning(messages) {
+function withThinkingPassback(messages) {
   if (!Array.isArray(messages)) return messages;
   let changed = false;
   const out = messages.map((message) => {
-    if (!message || !Array.isArray(message.content)) return message;
+    if (!message || message.role !== 'assistant' || !Array.isArray(message.content)) return message;
     const blocks = message.content;
-    if (!blocks.some((block) => block && block.type === 'reasoning')) return message;
+    if (!blocks.some((block) => block && block.type === 'tool-call')) return message;
+    if (blocks.some((block) => block && block.type === 'reasoning')) return message;
     changed = true;
-    const content = Object.freeze(blocks.filter((block) => !(block && block.type === 'reasoning')));
-    return Object.freeze({ ...message, content });
+    const placeholder = Object.freeze({ type: 'reasoning', text: ' ' });
+    return Object.freeze({ ...message, content: Object.freeze([placeholder, ...blocks]) });
   });
   return changed ? Object.freeze(out) : messages;
 }
+
 
 /**
  * 队列里一条路由对应的子请求参数：换路由 + 剥掉上一台适配器物化的控制字段 + 历史适配。
@@ -324,22 +338,19 @@ function withoutReasoning(messages) {
  * @param {{provider: string, model: string}} route 实际要试的路由
  * @returns {object} 可直接下发给宿主 llm.stream 的请求
  */
-function routeCallOptions(options, route) {
+function routeCallOptions(options, route, config = {}) {
   const routeChanged = options.provider !== route.provider || options.model !== route.model;
   const next = { ...options, provider: route.provider, model: route.model };
   if (!routeChanged) return next;
   delete next.maxTokens;
-  if (options.provider === route.provider) {
-    // Другая модель того же провайдера: свои дефолты резолвит сама.
-    delete next.reasoningEffort;
-    return next;
+  // Уровень рассуждений — выбор прошлой модели; цель резолвит свой (thinking остаётся
+  // включённым, качество не роняем). Иначе хост может отвергнуть неизвестный уровень.
+  delete next.reasoningEffort;
+  if (options.provider !== route.provider && providerList(config.thinkingPassbackProviders).includes(route.provider)) {
+    // Чужой истории нечего вернуть в thinking, а сервис требует блок у tool-call-ходов.
+    const patched = withThinkingPassback(options.messages);
+    if (patched !== options.messages) next.messages = patched;
   }
-  // Другой провайдер: работаем без thinking. Иначе DeepSeek в thinking-режиме
-  // требует вернуть thinking у tool-call-ходов, а у чужой истории его нет —
-  // сервис пробует восстановить по tool-call id и отвечает 400 content[].thinking.
-  next.reasoningEffort = 'off';
-  const stripped = withoutReasoning(options.messages);
-  if (stripped !== options.messages) next.messages = stripped;
   return next;
 }
 
@@ -2339,7 +2350,7 @@ export function apply(ctx, pluginConfig = {}) {
    * и без reasoning-блоков (см. routeCallOptions).
    */
   function subCallOptions(options, route) {
-    return routeCallOptions(options, route);
+    return routeCallOptions(options, route, config);
   }
 
   /**

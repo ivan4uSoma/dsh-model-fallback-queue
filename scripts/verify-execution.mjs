@@ -401,9 +401,10 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], maxTokens: 100,
     });
     ok('方案B：先试 capbad（能力不匹配）再换 good', fllm.calls[0] === 'p/capbad' && fllm.calls[1] === 'p/good', fllm.calls.join(','));
-    // Переход на другого провайдера идёт без thinking ('off' — валидный уровень),
-    // а не с унаследованным 'balanced': иначе DeepSeek 400 content[].thinking.
-    ok('方案B：резерв без thinking (reasoningEffort=off)', fllm.reqs.every((r) => r.reasoningEffort === 'off'), JSON.stringify(fllm.reqs.map((r) => r.reasoningEffort)));
+    // Уровень прошлой модели не наследуется (цель резолвит свой), thinking при этом
+    // остаётся включённым: quality сохраняем.
+    ok('方案B：уровень рассуждений не наследуется (резолвит цель)',
+      fllm.reqs.every((r) => r.reasoningEffort === undefined), JSON.stringify(fllm.reqs.map((r) => r.reasoningEffort)));
     const lastFinish = [...frames].reverse().find((c) => c.type === 'finish');
     ok('方案B：换到 good 后正常结束', lastFinish?.reason?.kind === 'stop', JSON.stringify(lastFinish?.reason));
     const snapF = await svc.snapshot();
@@ -1080,7 +1081,7 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     });
     ok('wl：P1 失败后真的换到队列路由', xllm.calls[0] === 'deepseek-official/auth' && xllm.calls[1] === 'zai/glm-5.3', xllm.calls.join(','));
     ok('wl：换路由后 maxTokens 不继承（否则 z.ai 400 code 1210）', xllm.reqs[1]?.maxTokens === undefined, `maxTokens=${xllm.reqs[1]?.maxTokens}`);
-    ok('wl：换到 другого провайдера → thinking выключен', xllm.reqs[1]?.reasoningEffort === 'off', `effort=${xllm.reqs[1]?.reasoningEffort}`);
+    ok('wl：换到 другого провайдера → уровень снят, thinking включён', xllm.reqs[1]?.reasoningEffort === undefined, `effort=${xllm.reqs[1]?.reasoningEffort}`);
 
   }
 }
@@ -1120,9 +1121,9 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     await collect({ sessionId: 'sess-wl-tools', provider: 'zai', model: 'auth', reasoningEffort: 'high', messages });
     ok('H-2: резервный провайдер пробуется после отказа P1',
       zllm.calls.length === 2 && zllm.calls[1] === 'deepseek-official/good', zllm.calls.join(','));
-    ok('H-2: резерв идёт без thinking', zllm.reqs[1]?.reasoningEffort === 'off', `effort=${zllm.reqs[1]?.reasoningEffort}`);
-    ok('H-2: reasoning-блоки в резерв не уходят, tool-call и text остаются',
-      JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)) === JSON.stringify(['text', 'tool-call']),
+    ok('H-2: thinking остаётся включённым (уровень резолвит цель)', zllm.reqs[1]?.reasoningEffort === undefined, `effort=${zllm.reqs[1]?.reasoningEffort}`);
+    ok('H-2: своё reasoning уходит в резерв как есть',
+      JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)) === JSON.stringify(['reasoning', 'text', 'tool-call']),
       JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)));
     ok('H-2: исходная история не испорчена', messages[1].content.length === 3);
   }
@@ -1152,7 +1153,7 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     await collect({ sessionId: 'sess-wl-plain', provider: 'zai', model: 'auth', messages });
     ok('H-3: без инструментов переход на другого провайдера работает',
       wllm.calls[0] === 'zai/auth' && wllm.calls[1] === 'deepseek-official/good', wllm.calls.join(','));
-    ok('H-3: резерв без thinking', wllm.reqs[1]?.reasoningEffort === 'off');
+    ok('H-3: уровень не наследуется, thinking включён', wllm.reqs[1]?.reasoningEffort === undefined);
   }
 }
 

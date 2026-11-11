@@ -1,15 +1,14 @@
 /**
- * Переключение маршрута: управляющие поля и форма резервного запроса.
+ * Переключение маршрута: управляющие поля и thinking-passback для резерва.
  *
- * Требование владельца: когда у модели кончилась квота — продолжить на другой модели
- * (DeepSeek flash ⇄ GLM), включая суб-агентов, без подмены истории.
+ * Требование владельца: квота кончилась — работа продолжается на другой модели
+ * (DeepSeek flash ⇄ GLM), включая суб-агентов, без потери качества рассуждений.
  *
- * Почему резерв идёт без thinking: DeepSeek в thinking-режиме требует вернуть thinking
- * у каждого tool-call-хода («If thinking content is omitted, the service may recover it
- * using the tool-call IDs; if recovery is required but fails, the request returns a 400
- * error», api-docs.deepseek.com/guides/anthropic_api). У GLM-истории своего thinking для
- * DeepSeek нет. Поэтому резервный запрос: reasoningEffort 'off' + reasoning-блоки не
- * передаются; это обычный tool-loop, который принимают оба провайдера.
+ * Механика: DeepSeek в thinking-режиме требует thinking у каждого tool-call-хода, но
+ * входную сигнатуру не валидирует («the input signature is not validated»,
+ * api-docs.deepseek.com/api/create-message). Поэтому: своё reasoning передаём как есть,
+ * а ходу с tool_use без рассуждений кладём минимальную заглушку. Thinking остаётся
+ * включённым — качество не режем (прежние попытки его срезать/гасить отвергнуты).
  *
  * Функции вырезаются из index.js по балансу скобок и исполняются те же, что в бою.
  *
@@ -61,70 +60,82 @@ function extractFunction(src, name) {
   throw new Error(`unbalanced braces for ${name}`)
 }
 
-const names = ['withoutReasoning', 'routeCallOptions']
+const names = ['providerList', 'withThinkingPassback', 'routeCallOptions']
 const bundle = names.map((name) => extractFunction(indexSrc, name)).join('\n')
-const { withoutReasoning, routeCallOptions } = new Function(
-  `${bundle}\nreturn { withoutReasoning, routeCallOptions }`,
+const { withThinkingPassback, routeCallOptions } = new Function(
+  `${bundle}\nreturn { providerList, withThinkingPassback, routeCallOptions }`,
 )()
 
+const CONFIG = { thinkingPassbackProviders: ['deepseek-official'] }
 const text = (value) => Object.freeze({ type: 'text', text: value })
 const reasoning = (value) => Object.freeze({ type: 'reasoning', text: value })
 const toolCall = (id) => Object.freeze({ type: 'tool-call', id, name: 'bash', arguments: '{}' })
 
-// ---- 1) без reasoning: массив без блоков возвращается как есть ----
+// ---- 1) passback: заглушка только у tool-call-ходов без рассуждений ----
 const plain = Object.freeze([{ role: 'user', content: Object.freeze([text('привет')]) }])
-check('нет reasoning → тот же массив', withoutReasoning(plain) === plain)
-check('undefined → undefined', withoutReasoning(undefined) === undefined)
+check('нет tool-call → тот же массив', withThinkingPassback(plain) === plain)
+check('undefined → undefined', withThinkingPassback(undefined) === undefined)
 
-const withReasoning = Object.freeze([
-  Object.freeze({ role: 'user', content: Object.freeze([text('привет')]) }),
-  Object.freeze({
-    role: 'assistant',
-    content: Object.freeze([reasoning('думаю'), text('вызываю'), toolCall('c1')]),
-    source: Object.freeze({ kind: 'model', provider: 'zai', model: 'glm-5.3' }),
-  }),
-  Object.freeze({ role: 'tool', content: Object.freeze([text('ok')]), toolCallId: 'c1' }),
-])
-const stripped = withoutReasoning(withReasoning)
-check('reasoning есть → новый массив', stripped !== withReasoning)
-eq('reasoning снят, text и tool-call остались', stripped[1].content.map((b) => b.type), ['text', 'tool-call'])
-eq('user и tool не тронуты', [stripped[0], stripped[2]], [withReasoning[0], withReasoning[2]])
-eq('source сохранён', [stripped[1].source.provider, stripped[1].source.model], ['zai', 'glm-5.3'])
-check('исходная история не изменена', withReasoning[1].content.length === 3)
-check('результат заморожен', Object.isFrozen(stripped) && Object.isFrozen(stripped[1].content))
+const toolOnly = Object.freeze({
+  role: 'assistant',
+  content: Object.freeze([toolCall('c1')]),
+  source: Object.freeze({ kind: 'model', provider: 'zai', model: 'glm-5.3' }),
+})
+const withRealReasoning = Object.freeze({
+  role: 'assistant',
+  content: Object.freeze([reasoning('настоящее рассуждение'), text('вызываю'), toolCall('c2')]),
+})
+const textOnly = Object.freeze({ role: 'assistant', content: Object.freeze([text('готово')]) })
+const history = Object.freeze([plain[0], toolOnly, withRealReasoning, textOnly])
 
-// ---- 2) маршрут не менялся → копия с полями ----
+const patched = withThinkingPassback(history)
+check('есть что править → новый массив', patched !== history)
+eq('ход без рассуждений получил thinking-заглушку',
+  patched[1].content.map((b) => b.type), ['reasoning', 'tool-call'])
+eq('заглушка минимальная (пробел), не выдумка',
+  [patched[1].content[0].type, patched[1].content[0].text], ['reasoning', ' '])
+check('настоящее reasoning не подменено',
+  patched[2].content[0].text === 'настоящее рассуждение' && patched[2].content.length === 3)
+check('text-only ход не тронут', patched[3] === textOnly)
+check('исходная история не изменена', history[1].content.length === 1)
+check('результат заморожен', Object.isFrozen(patched) && Object.isFrozen(patched[1].content))
+
+// ---- 2) маршрут не менялся ----
 const request = Object.freeze({
   provider: 'deepseek-official',
   model: 'deepseek-flash',
   reasoningEffort: 'max',
   maxTokens: 256000,
-  messages: withReasoning,
+  messages: history,
   sessionId: 's1',
 })
-const sameRoute = routeCallOptions(request, { provider: 'deepseek-official', model: 'deepseek-flash' })
+const sameRoute = routeCallOptions(request, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG)
 eq('тот же маршрут: maxTokens сохранён', sameRoute.maxTokens, 256000)
 eq('тот же маршрут: reasoningEffort сохранён', sameRoute.reasoningEffort, 'max')
-check('тот же маршрут: сообщения не переписываются', sameRoute.messages === withReasoning)
+check('тот же маршрут: история не правится', sameRoute.messages === history)
 
-// ---- 3) другая модель того же провайдера: снять управляющие поля ----
-const sameProvider = routeCallOptions(request, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
-eq('своя модель: provider/model заменены', [sameProvider.provider, sameProvider.model], ['deepseek-official', 'deepseek-v4-pro'])
+// ---- 3) другая модель того же провайдера ----
+const sameProvider = routeCallOptions(request, { provider: 'deepseek-official', model: 'deepseek-v4-pro' }, CONFIG)
 check('своя модель: maxTokens снят', !('maxTokens' in sameProvider))
-check('своя модель: reasoningEffort снят (резолвит целевая модель)', !('reasoningEffort' in sameProvider))
-check('своя модель: история не переписывается', sameProvider.messages === withReasoning)
+check('своя модель: reasoningEffort снят (резолвит цель)', !('reasoningEffort' in sameProvider))
+check('своя модель: история не правится', sameProvider.messages === history)
 
-// ---- 4) другой провайдер: без thinking и без reasoning (сценарий владельца) ----
-const toZai = routeCallOptions(request, { provider: 'zai', model: 'glm-5.3' })
-eq('резерв: provider/model заменены', [toZai.provider, toZai.model], ['zai', 'glm-5.3'])
-check('резерв: maxTokens снят (иначе z.ai 400 code 1210)', !('maxTokens' in toZai))
-eq('резерв: thinking выключен (иначе DeepSeek 400 content[].thinking)', toZai.reasoningEffort, 'off')
-eq('резерв: reasoning-блоков нет', toZai.messages[1].content.map((b) => b.type), ['text', 'tool-call'])
-check('резерв: исходный запрос не изменён', request.reasoningEffort === 'max' && request.maxTokens === 256000 && withReasoning[1].content.length === 3)
+// ---- 4) резерв на DeepSeek: thinking включён, заглушки только где нет рассуждений ----
+const toDeep = routeCallOptions({ ...request, provider: 'zai', model: 'glm-5.3' }, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG)
+eq('резерв: provider/model заменены', [toDeep.provider, toDeep.model], ['deepseek-official', 'deepseek-flash'])
+check('резерв: maxTokens снят', !('maxTokens' in toDeep))
+check('резерв: thinking НЕ выключен (качество сохраняем)', !('reasoningEffort' in toDeep) && toDeep.reasoningEffort !== 'off')
+eq('резерв: ход без рассуждений получил thinking-блок',
+  toDeep.messages[1].content.map((b) => b.type), ['reasoning', 'tool-call'])
+check('резерв: настоящее reasoning сохранено',
+  toDeep.messages[2].content[0].text === 'настоящее рассуждение' && toDeep.messages[2].content.length === 3)
+check('резерв: исходная история не испорчена',
+  history[1].content.length === 1 && history[2].content.length === 3)
 
-const backToDeep = routeCallOptions({ ...request, provider: 'zai', model: 'glm-5.3' }, { provider: 'deepseek-official', model: 'deepseek-flash' })
-eq('резерв в обратную сторону: thinking выключен', backToDeep.reasoningEffort, 'off')
-eq('резерв в обратную сторону: reasoning снят', backToDeep.messages[1].content.map((b) => b.type), ['text', 'tool-call'])
+// ---- 5) резерв на провайдера не из списка: историю не трогаем ----
+const toZai = routeCallOptions(request, { provider: 'zai', model: 'glm-5.3' }, CONFIG)
+check('резерв на z.ai: историю не правим (там reasoning_content терпим)', toZai.messages === history)
+check('резерв на z.ai: thinking тоже не выключаем', !('reasoningEffort' in toZai))
 
 if (failures.length > 0) {
   console.error(`✗ route switch: ${failures.length} failure(s), ${pass} passed`)
