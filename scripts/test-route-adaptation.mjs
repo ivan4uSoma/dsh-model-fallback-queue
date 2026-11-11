@@ -128,6 +128,15 @@ const toolOnly = assistantFixture({
   replayKind: 'pi-ai',
   blocks: [toolCall('c4')],
 });
+// 真实故障 2026-11-11：GLM-сессия шага 9 уходила в DeepSeek с assistant-сообщением
+// reasoning + tool_use без text. Прежний фильтр (только text) такое сообщение не трогал,
+// reasoning уезжал в Anthropic-адаптер, тот превращал его в text-блок → 400 content[].thinking.
+const zaiReasoningOnly = assistantFixture({
+  provider: 'zai',
+  model: 'glm-5.3',
+  replayKind: 'pi-ai',
+  blocks: [reasoning('думаю'), toolCall('c5')],
+});
 const userMessage = { role: 'user', content: Object.freeze([text('привет')]) };
 
 const messages = Object.freeze([
@@ -135,18 +144,19 @@ const messages = Object.freeze([
   zaiForeign,
   deepseekNative,
   deepseekMisattributed,
+  zaiReasoningOnly,
   textOnly,
   toolOnly,
 ]);
 
-// ---- 1) 历史适配：只动“严格 provider + text+tool_use + 非原生 replay”的消息 ----
+// ---- 1) 历史适配：只动“严格 provider + 带 tool_use 且 thinking 不可原生重放”的消息 ----
 const adapted = adaptMessagesForRoute(messages, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG);
 check('адаптация вернула новый массив', adapted !== messages);
 check('входной массив не изменён', messages[1].content.length === 3, 'foreign message mutated');
 eq(
-  'foreign (zai/pi-ai): text снят, tool-call и reasoning на месте',
+  'foreign (zai/pi-ai): text и reasoning сняты, tool-call на месте',
   adapted[1].content.map((b) => b.type),
-  ['reasoning', 'tool-call'],
+  ['tool-call'],
 );
 eq(
   'native (deepseek-messages): не тронут',
@@ -158,8 +168,13 @@ eq(
   adapted[3].content.map((b) => b.type),
   ['tool-call'],
 );
-eq('text-only assistant не тронут', adapted[4], textOnly);
-eq('tool-only assistant не тронут', adapted[5], toolOnly);
+eq(
+  'reasoning + tool-call без text (реальный боевой случай): reasoning снят',
+  adapted[4].content.map((b) => b.type),
+  ['tool-call'],
+);
+eq('text-only assistant не тронут', adapted[5], textOnly);
+eq('tool-only assistant не тронут', adapted[6], toolOnly);
 eq('user message не тронут', adapted[0], userMessage);
 check('адаптированные сообщения заморожены', Object.isFrozen(adapted[1]) && Object.isFrozen(adapted[1].content));
 
@@ -176,7 +191,7 @@ check('strictThinkingProviders пуст → история не тронута',
 // ---- 4) onAdapted 计数 ----
 let adaptedCount = -1;
 adaptMessagesForRoute(messages, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG, { onAdapted: (n) => { adaptedCount = n; } });
-eq('onAdapted 计数（foreign + misattributed）', adaptedCount, 2);
+eq('onAdapted 计数（foreign + misattributed + reasoning-only）', adaptedCount, 3);
 
 // ---- 5) 换路由：剥离 P1 适配器物化的控制字段 ----
 const request = Object.freeze({
@@ -196,7 +211,7 @@ eq('换路由：sessionId 保留', toZai.sessionId, 's1');
 check('换路由：请求对象原样保留，不被改写', request.maxTokens === 256000 && request.reasoningEffort === 'max');
 
 const toDeepseek = routeCallOptions({ ...request, provider: 'zai', model: 'glm-5.3' }, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG);
-check('换到 deepseek：历史已适配', toDeepseek.messages !== messages && toDeepseek.messages[1].content.length === 2);
+check('换到 deepseek：历史已适配', toDeepseek.messages !== messages && toDeepseek.messages[1].content.length === 1);
 
 // ---- 6) 路由不变 → 控制字段原样保留 ----
 const sameRoute = routeCallOptions(request, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG);

@@ -75,9 +75,11 @@ const DEFAULT_CONFIG = {
   // 否则 400（DeepSeek Anthropic 兼容端点原文：「The `content[].thinking` in the
   // thinking mode must be passed back to the API.」）。
   //
-  // 对这里列出的 provider，下发给它之前把这类消息的 text 块摘掉：assistant 只带
-  // tool_use（不带 text、不带 thinking）是该 API 接受的形状，工具调用/参数/结果不动，
-  // 只损失模型写在工具调用旁边的解说文字——跨适配器降级时最小的损失。
+  // 对这里列出的 provider，下发给它之前把这类消息的 text 和 reasoning 块都摘掉：
+  // assistant 只带 tool_use（不带 text、不带 thinking）是该 API 接受的形状，工具调用/
+  // 参数/结果不动，只损失模型写在工具调用旁边的解说文字与思考——跨适配器降级时的
+  // 最小代价。只摘 text 不够：宿主的 Anthropic 适配层会把没有签名的 thinking 转成
+  // text 发出（见 adaptMessagesForRoute 注释），reasoning 留在消息里照样触发同一条 400。
   strictThinkingProviders: ['deepseek-official'],
   // provider → 该 provider 原生 replayState.response.kind。历史消息的 thinking 只有
   // 在 kind 与目标 provider 原生 kind 一致时才能真正被重放；对不上（比如 z.ai 的
@@ -338,7 +340,13 @@ function messageReplayIsNative(message, route, kinds) {
 }
 
 /**
- * 历史适配：目标路由无法重放旧 thinking 时，摘掉「text + tool_use」assistant 消息的 text。
+ * 历史适配：目标路由无法重放旧 thinking 时，摘掉 assistant 消息里的 text 和 reasoning。
+ *
+ * 为什么 reasoning 也要摘：宿主的 Anthropic 适配层对「没有签名」的 thinking 块不是丢掉，
+ * 而是转成 text 块发出（pi-ai `anthropic-messages`：`!hasThinkingSignature` → `text`）。
+ * 跨适配器历史里的 reasoning 正好没有签名，于是只摘 text 的话，消息到端点仍变成
+ * 「text（由 reasoning 转来）+ tool_use」——还是那条 400 `content[].thinking`。
+ * 只留 tool_use 才是该端点接受的形状。
  *
  * 只对 config.strictThinkingProviders 里列出的 provider 生效；路由不变或历史本来就是
  * 该路由原生生成的（replay kind 对得上）时原样返回，不动用户的历史。
@@ -360,11 +368,11 @@ function adaptMessagesForRoute(messages, route, config = {}, hooks = {}) {
     const blocks = message.content;
     const hasToolCall = blocks.some((block) => block && block.type === 'tool-call');
     if (!hasToolCall) return message;
-    const hasText = blocks.some((block) => block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0);
-    if (!hasText) return message;
+    const convertible = blocks.some((block) => block && (block.type === 'text' || block.type === 'reasoning'));
+    if (!convertible) return message;
     if (messageReplayIsNative(message, route, kinds)) return message;
     adapted += 1;
-    const content = Object.freeze(blocks.filter((block) => !(block && block.type === 'text')));
+    const content = Object.freeze(blocks.filter((block) => !(block && (block.type === 'text' || block.type === 'reasoning'))));
     return Object.freeze({ ...message, content });
   });
   if (adapted === 0) return messages;
