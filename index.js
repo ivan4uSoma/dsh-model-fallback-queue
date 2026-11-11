@@ -77,6 +77,10 @@ const DEFAULT_CONFIG = {
   // не валидирует — значит для чужих ходов без рассуждений достаточно заглушки.
   // См. withThinkingPassback.
   thinkingPassbackProviders: ['deepseek-official'],
+  // Кому при резервном переходе сохраняем уровень рассуждений прошлой модели
+  // (для DeepSeek 'max' валиден; у чужих провайдеров уровень может не существовать,
+  // поэтому список явный, а не «всем подряд»).
+  preserveReasoningEffortProviders: ['deepseek-official'],
 };
 
 /** settings 里不允许出现的键：queue 已迁到 state 文件 */
@@ -343,9 +347,18 @@ function routeCallOptions(options, route, config = {}) {
   const next = { ...options, provider: route.provider, model: route.model };
   if (!routeChanged) return next;
   delete next.maxTokens;
-  // Уровень рассуждений — выбор прошлой модели; цель резолвит свой (thinking остаётся
-  // включённым, качество не роняем). Иначе хост может отвергнуть неизвестный уровень.
-  delete next.reasoningEffort;
+  if (options.provider === route.provider) {
+    // Другая модель того же провайдера: свои дефолты резолвит сама.
+    delete next.reasoningEffort;
+    return next;
+  }
+  // Резерв на другого провайдера. Уровень рассуждений сохраняем для перечисленных
+  // провайдеров (DeepSeek: 'max' валиден, владелец на нём и работает), у прочих
+  // снимаем — цель резолвит свой, иначе хост может отвергнуть неизвестный уровень.
+  // Thinking при этом остаётся включённым в любом случае.
+  if (!providerList(config.preserveReasoningEffortProviders).includes(route.provider)) {
+    delete next.reasoningEffort;
+  }
   if (options.provider !== route.provider && providerList(config.thinkingPassbackProviders).includes(route.provider)) {
     // Чужой истории нечего вернуть в thinking, а сервис требует блок у tool-call-ходов.
     const patched = withThinkingPassback(options.messages);

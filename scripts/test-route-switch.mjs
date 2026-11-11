@@ -66,7 +66,7 @@ const { withThinkingPassback, routeCallOptions } = new Function(
   `${bundle}\nreturn { providerList, withThinkingPassback, routeCallOptions }`,
 )()
 
-const CONFIG = { thinkingPassbackProviders: ['deepseek-official'] }
+const CONFIG = { thinkingPassbackProviders: ['deepseek-official'], preserveReasoningEffortProviders: ['deepseek-official'] }
 const text = (value) => Object.freeze({ type: 'text', text: value })
 const reasoning = (value) => Object.freeze({ type: 'reasoning', text: value })
 const toolCall = (id) => Object.freeze({ type: 'tool-call', id, name: 'bash', arguments: '{}' })
@@ -124,7 +124,7 @@ check('своя модель: история не правится', sameProvide
 const toDeep = routeCallOptions({ ...request, provider: 'zai', model: 'glm-5.3' }, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONFIG)
 eq('резерв: provider/model заменены', [toDeep.provider, toDeep.model], ['deepseek-official', 'deepseek-flash'])
 check('резерв: maxTokens снят', !('maxTokens' in toDeep))
-check('резерв: thinking НЕ выключен (качество сохраняем)', !('reasoningEffort' in toDeep) && toDeep.reasoningEffort !== 'off')
+eq('резерв на DeepSeek: уровень рассуждений сохранён (max остаётся max)', toDeep.reasoningEffort, 'max')
 eq('резерв: ход без рассуждений получил thinking-блок',
   toDeep.messages[1].content.map((b) => b.type), ['reasoning', 'tool-call'])
 check('резерв: настоящее reasoning сохранено',
@@ -135,7 +135,7 @@ check('резерв: исходная история не испорчена',
 // ---- 5) резерв на провайдера не из списка: историю не трогаем ----
 const toZai = routeCallOptions(request, { provider: 'zai', model: 'glm-5.3' }, CONFIG)
 check('резерв на z.ai: историю не правим (там reasoning_content терпим)', toZai.messages === history)
-check('резерв на z.ai: thinking тоже не выключаем', !('reasoningEffort' in toZai))
+check('резерв на z.ai: уровень снят (свой дефолт), thinking включён', !('reasoningEffort' in toZai))
 
 if (failures.length > 0) {
   console.error(`✗ route switch: ${failures.length} failure(s), ${pass} passed`)

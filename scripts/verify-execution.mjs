@@ -1121,7 +1121,7 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     await collect({ sessionId: 'sess-wl-tools', provider: 'zai', model: 'auth', reasoningEffort: 'high', messages });
     ok('H-2: резервный провайдер пробуется после отказа P1',
       zllm.calls.length === 2 && zllm.calls[1] === 'deepseek-official/good', zllm.calls.join(','));
-    ok('H-2: thinking остаётся включённым (уровень резолвит цель)', zllm.reqs[1]?.reasoningEffort === undefined, `effort=${zllm.reqs[1]?.reasoningEffort}`);
+    ok('H-2: уровень рассуждений сохранён для DeepSeek', zllm.reqs[1]?.reasoningEffort === 'high', `effort=${zllm.reqs[1]?.reasoningEffort}`);
     ok('H-2: своё reasoning уходит в резерв как есть',
       JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)) === JSON.stringify(['reasoning', 'text', 'tool-call']),
       JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)));
