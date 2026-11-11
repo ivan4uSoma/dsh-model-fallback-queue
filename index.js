@@ -3,8 +3,9 @@
  *
  * 模型故障转移队列：
  * - llm/stream (middleware): runFallbackChain 从 P1（会话模型）起逐条重试队列；失败
- *   尝试换下一条路由，成功即接管。跨 провайдер 的 переход разрешён только пока в
- *   истории нет tool-call/tool-result（иначе DeepSeek 400 content[].thinking）。
+ *   尝试换下一条路由，成功即接管。Переход на другого провайдера идёт в режиме без
+ *   thinking (reasoningEffort 'off', reasoning-блоки не передаются) — иначе DeepSeek
+ *   отвечает 400 content[].thinking на чужую историю.
  * - agent/request (waterfall): 只观察，不改 provider/model（новый хост это запрещает）。
  * - agent/request-error (waterfall): 请求失败时判定熔断码；命中即时码或软阈值则熔断
  *   当前路由，并返回 { kind: 'retry' } 让 agent-loop 用新配置重试同一步。
@@ -71,10 +72,9 @@ const DEFAULT_CONFIG = {
   probeConcurrency: 4,
   // 「探测完成」逐条状态在快照里保留多久（毫秒），到点自动清空/淡出。
   probeStatusTtlMs: 4000,
-  // Кросс-провайдерный переход с историей инструментов запрещён: DeepSeek требует
-  // возвращать thinking у tool-call-ходов, и чужую (GLM) историю отдать невозможно —
-  // сервис пытается восстановить thinking по id инструментов и падает 400. См.
-  // historyHasToolExchange ниже и guard в runFallbackChain.
+  // Кросс-провайдерный резерв идёт без thinking: у DeepSeek thinking у tool-call-ходов
+  // нужно вернуть, а чужой (GLM) истории нечего вернуть — сервис пробует восстановить
+  // по id инструментов и падает 400. См. routeCallOptions / withoutReasoning.
 };
 
 /** settings 里不允许出现的键：queue 已迁到 state 文件 */
@@ -291,44 +291,28 @@ function withRouteOverride(cfg, route) {
 }
 
 /**
- * Есть ли в истории запроса обмен с инструментами (tool-call / tool-result).
+ * История без reasoning-блоков — для запроса на другого провайдера.
  *
- * Зачем: DeepSeek (Anthropic-эндпоинт) требует возвращать thinking у assistant-ходов с
- * tool_use. Чужая история (например GLM через z.ai) thinking отдать не может: сервис
- * пытается восстановить его по tool-call id, у чужих id это не выходит и запрос падает
- * 400 `content[].thinking`. Поэтому при такой истории переключаться на другого
- * провайдера нельзя — только внутри своего.
+ * Чужое reasoning некуда деть: у DeepSeek thinking-блок обязан вернуться вместе с
+ * tool-call-ходом, а подпись и содержание GLM для него не свои. Поэтому в резервном
+ * запросе reasoning не передаём вовсе, а сам запрос идёт без thinking (см.
+ * routeCallOptions) — это обычный tool-loop, который принимают оба провайдера.
  *
  * @param {Array<object>} messages сообщения harness-запроса
- * @returns {boolean} true — в истории есть вызовы инструментов или их результаты
+ * @returns {Array<object>} тот же массив, если reasoning нет, иначе копия без них
  */
-/**
- * Допустим ли переход с P1 на эту строку очереди при данной истории.
- *
- * Переход на другого провайдера разрешён только без истории инструментов: иначе
- * DeepSeek получает чужие tool_use без thinking и отвечает 400.
- *
- * @param {boolean} toolHistory есть ли в истории обмен с инструментами
- * @param {string} originProvider провайдер P1 (модель сессии)
- * @param {{provider: string}} route проверяемая строка очереди
- * @returns {boolean} true — переход допустим
- */
-function crossProviderSwitchAllowed(toolHistory, originProvider, route) {
-  if (!toolHistory) return true;
-  if (!route || typeof route.provider !== 'string') return false;
-  return route.provider === originProvider;
-}
-
-function historyHasToolExchange(messages) {
-  if (!Array.isArray(messages)) return false;
-  return messages.some((message) => {
-    if (!message || typeof message !== 'object') return false;
-    if (message.role === 'tool') return true;
+function withoutReasoning(messages) {
+  if (!Array.isArray(messages)) return messages;
+  let changed = false;
+  const out = messages.map((message) => {
+    if (!message || !Array.isArray(message.content)) return message;
     const blocks = message.content;
-    if (!Array.isArray(blocks)) return false;
-    return blocks.some((block) => block && typeof block === 'object'
-      && (block.type === 'tool-call' || block.type === 'tool-result'));
+    if (!blocks.some((block) => block && block.type === 'reasoning')) return message;
+    changed = true;
+    const content = Object.freeze(blocks.filter((block) => !(block && block.type === 'reasoning')));
+    return Object.freeze({ ...message, content });
   });
+  return changed ? Object.freeze(out) : messages;
 }
 
 /**
@@ -344,8 +328,18 @@ function routeCallOptions(options, route) {
   const routeChanged = options.provider !== route.provider || options.model !== route.model;
   const next = { ...options, provider: route.provider, model: route.model };
   if (!routeChanged) return next;
-  delete next.reasoningEffort;
   delete next.maxTokens;
+  if (options.provider === route.provider) {
+    // Другая модель того же провайдера: свои дефолты резолвит сама.
+    delete next.reasoningEffort;
+    return next;
+  }
+  // Другой провайдер: работаем без thinking. Иначе DeepSeek в thinking-режиме
+  // требует вернуть thinking у tool-call-ходов, а у чужой истории его нет —
+  // сервис пробует восстановить по tool-call id и отвечает 400 content[].thinking.
+  next.reasoningEffort = 'off';
+  const stripped = withoutReasoning(options.messages);
+  if (stripped !== options.messages) next.messages = stripped;
   return next;
 }
 
@@ -2341,8 +2335,8 @@ export function apply(ctx, pluginConfig = {}) {
    * 可能不认。
    *
    * 历史本身不改：DeepSeek 要求 tool-call 的 assistant 消息带回 thinking，把它摘掉
-   * 只会让请求必挂 400（см. historyHasToolExchange）。Кросс-провайдерный переход с
-   * такой историей запрещён выше, в runFallbackChain.
+   * нельзя: DeepSeek требует его вернуть. Поэтому резервный запрос идёт без thinking
+   * и без reasoning-блоков (см. routeCallOptions).
    */
   function subCallOptions(options, route) {
     return routeCallOptions(options, route);
@@ -2380,10 +2374,6 @@ export function apply(ctx, pluginConfig = {}) {
 
   async function* runFallbackChain(options) {
     const sessionId = options?.sessionId ?? null;
-    // Провайдер сессии (P1) и признак «в истории есть инструменты»: по ним решается,
-    // допустим ли переход на другого провайдера при отказе этой попытки.
-    const originProvider = options?.provider;
-    const toolHistory = historyHasToolExchange(options?.messages);
     const full = buildFallbackChain(sessionId);
     // 插件关闭时不应继续故障转移：只走第一条（P1 会话模型），把行为交还给正常路径。
     // 全熔断时也只试一条（冷却最早到期的）——见 availableFallbackChain 的注释：
@@ -2448,18 +2438,6 @@ export function apply(ctx, pluginConfig = {}) {
         router.setPendingConfirm(sessionId, null);
         router.touch();
       };
-      // Кросс-провайдерный переход с историей инструментов запрещён: у DeepSeek
-      // thinking у tool-call-ходов нужно вернуть, а чужие (GLM) ходы его не имеют —
-      // сервис пробует восстановить по tool-call id, не выходит и приходит 400.
-      // Внутри своего провайдера переходы остаются.
-      if (!crossProviderSwitchAllowed(toolHistory, originProvider, route)) {
-        ctx.logger?.info?.(
-          '[fallback-queue] skip %s/%s: cross-provider switch with tool history is not portable',
-          route.provider,
-          route.model,
-        );
-        continue;
-      }
       markRequest('sent');
       let sub;
       try {

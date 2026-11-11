@@ -401,7 +401,9 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], maxTokens: 100,
     });
     ok('方案B：先试 capbad（能力不匹配）再换 good', fllm.calls[0] === 'p/capbad' && fllm.calls[1] === 'p/good', fllm.calls.join(','));
-    ok('方案B：子请求剥离 reasoningEffort（否则宿主本地拒绝）', fllm.reqs.every((r) => r.reasoningEffort === undefined), JSON.stringify(fllm.reqs.map((r) => r.reasoningEffort)));
+    // Переход на другого провайдера идёт без thinking ('off' — валидный уровень),
+    // а не с унаследованным 'balanced': иначе DeepSeek 400 content[].thinking.
+    ok('方案B：резерв без thinking (reasoningEffort=off)', fllm.reqs.every((r) => r.reasoningEffort === 'off'), JSON.stringify(fllm.reqs.map((r) => r.reasoningEffort)));
     const lastFinish = [...frames].reverse().find((c) => c.type === 'finish');
     ok('方案B：换到 good 后正常结束', lastFinish?.reason?.kind === 'stop', JSON.stringify(lastFinish?.reason));
     const snapF = await svc.snapshot();
@@ -1078,13 +1080,14 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     });
     ok('wl：P1 失败后真的换到队列路由', xllm.calls[0] === 'deepseek-official/auth' && xllm.calls[1] === 'zai/glm-5.3', xllm.calls.join(','));
     ok('wl：换路由后 maxTokens 不继承（否则 z.ai 400 code 1210）', xllm.reqs[1]?.maxTokens === undefined, `maxTokens=${xllm.reqs[1]?.maxTokens}`);
-    ok('wl：换路由后 reasoningEffort 不继承', xllm.reqs[1]?.reasoningEffort === undefined, `effort=${xllm.reqs[1]?.reasoningEffort}`);
+    ok('wl：换到 другого провайдера → thinking выключен', xllm.reqs[1]?.reasoningEffort === 'off', `effort=${xllm.reqs[1]?.reasoningEffort}`);
 
   }
 }
 
-// 场景 H-2：история с инструментами — переход на другого провайдера запрещён.
-// Именно этот кейс стрелял в бою 12.11 01:37 (b2b, шаг 111).
+// 场景 H-2：история с инструментами — переход разрешён, но в резервном режиме
+// (без thinking, без reasoning-блоков). Это сценарий владельца: квота кончилась —
+// работа продолжается на другой модели.
 {
   const zllm = makeLlm();
   const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, zllm);
@@ -1105,6 +1108,7 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
         role: 'assistant',
         content: [
           { type: 'reasoning', text: 'думаю' },
+          { type: 'text', text: 'вызываю' },
           { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
         ],
         source: { kind: 'model', provider: 'zai', model: 'auth', replayState: { response: { kind: 'pi-ai' } } },
@@ -1113,16 +1117,18 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     ];
     zllm.calls.length = 0;
     zllm.reqs.length = 0;
-    await collect({ sessionId: 'sess-wl-tools', provider: 'zai', model: 'auth', messages });
-    ok('H-2: при истории инструментов чужой провайдер не пробуется',
-      zllm.calls.length === 1 && zllm.calls[0] === 'zai/auth', zllm.calls.join(','));
-    ok('H-2: история не переписывается (никакой «адаптации» блоков)',
-      zllm.reqs[0]?.messages === messages || (zllm.reqs[0]?.messages?.[1]?.content?.length === 2),
-      JSON.stringify((zllm.reqs[0]?.messages?.[1]?.content || []).map((b) => b.type)));
+    await collect({ sessionId: 'sess-wl-tools', provider: 'zai', model: 'auth', reasoningEffort: 'high', messages });
+    ok('H-2: резервный провайдер пробуется после отказа P1',
+      zllm.calls.length === 2 && zllm.calls[1] === 'deepseek-official/good', zllm.calls.join(','));
+    ok('H-2: резерв идёт без thinking', zllm.reqs[1]?.reasoningEffort === 'off', `effort=${zllm.reqs[1]?.reasoningEffort}`);
+    ok('H-2: reasoning-блоки в резерв не уходят, tool-call и text остаются',
+      JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)) === JSON.stringify(['text', 'tool-call']),
+      JSON.stringify((zllm.reqs[1]?.messages?.[1]?.content || []).map((b) => b.type)));
+    ok('H-2: исходная история не испорчена', messages[1].content.length === 3);
   }
 }
 
-// 场景 H-3：без истории инструментов переход разрешён (начало сессии).
+// 场景 H-3：без истории инструментов — резерв тоже без thinking (единая политика).
 {
   const wllm = makeLlm();
   const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0 }, wllm);
@@ -1146,6 +1152,7 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     await collect({ sessionId: 'sess-wl-plain', provider: 'zai', model: 'auth', messages });
     ok('H-3: без инструментов переход на другого провайдера работает',
       wllm.calls[0] === 'zai/auth' && wllm.calls[1] === 'deepseek-official/good', wllm.calls.join(','));
+    ok('H-3: резерв без thinking', wllm.reqs[1]?.reasoningEffort === 'off');
   }
 }
 
