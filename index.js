@@ -49,6 +49,13 @@ const DEFAULT_CONFIG = {
   immediateCodes: DEFAULT_IMMEDIATE_CODES,
   failureThreshold: 2,
   cooldownMs: 60_000,
+  // Потолок ожидания переоткрытия внутри одного хода. Цепочка проходится один раз:
+  // если все живые маршруты отказали (P1 дал краткий 429, у резерва выбрана квота),
+  // ход раньше умирал целиком, хотя кулдаун P1 истекает через cooldownMs. Теперь
+  // плагин ждёт переоткрытия и делает одну повторную попытку. 90 с = 60 с кулдауна
+  // + запас на сам запрос. Маршруты с известной датой восстановления дальше потолка
+  // (недельная квота z.ai) не ждём: это не «вот-вот».
+  recoverWaitMs: 90_000,
   failbackMode: 'sticky', // 'sticky' | 'probe' | 'manual'
   failbackDelayMs: 5 * 60_000, // probe 模式防抖
   // 周期全员 ping 间隔（ms）；0 = 关闭。
@@ -611,6 +618,10 @@ function createRouter(config, log) {
     c.lastCode = typeof code === 'string' && code ? code : 'UNKNOWN';
     c.lastMessage = normalizeReason(message);
     c.retryAfterMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 0;
+    // Абсолютный момент восстановления, названный провайдером (квота «до 17.11»).
+    // Нужен решению «ждать или нет»: относительный retryAfterMs считается от момента
+    // отказа, а сравнивать его с потолком ожидания удобнее по абсолютной метке.
+    c.retryAfterAt = c.retryAfterMs > 0 ? Date.now() + c.retryAfterMs : 0;
     c.lastSource = source;
   }
 
@@ -2396,6 +2407,72 @@ export function apply(ctx, pluginConfig = {}) {
   // 内部子请求的 options 对象集合：llm/stream 监听器看到它们直接放行，避免递归包裹。
   const internalStreamOptions = new WeakSet();
 
+  /** Пауза, которую уважает отмена запроса: не держим один таймер на все 90 с. */
+  function sleepTick(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+  }
+
+  /**
+   * Ждёт маршрут, который переоткроется в пределах recoverWaitMs, и отдаёт его на
+   * одну повторную попытку. null = ждать нечего, ход закрываем ошибкой.
+   *
+   * Почему вообще ждём: цепочка проходится ОДИН раз. Если все живые маршруты
+   * отказали (P1 — краткий 429, у резерва выбрана недельная квота), прежнее
+   * поведение роняло весь ход, хотя кулдаун P1 истекал через cooldownMs.
+   *
+   * Маршруты с названной провайдером дальней датой восстановления (квота «до
+   * 17.11») не ждём: минутный кулдаун их не лечит, это не «вот-вот». Такая метка
+   * приходит из providerRetryAfterMs и хранится в circuit.retryAfterAt.
+   *
+   * @param {Array<{provider:string, model:string}>} full полная цепочка, включая
+   *        маршруты в кулдауне (доступные в этом ходу уже пробовали).
+   * @param {AbortSignal|undefined} signal отмена запроса.
+   * @returns {Promise<{provider:string, model:string}|null>}
+   */
+  async function waitForReopenedRoute(full, signal) {
+    const waitCap = Number(config.recoverWaitMs);
+    if (!(waitCap > 0)) return null;
+    const cooldown = Number(config.cooldownMs) || 0;
+    const now = Date.now();
+    let best = null;
+    let bestAt = Infinity;
+    for (const route of full) {
+      // Конфигурационно мёртвая маршрутка (нет адаптера / модели) не оживёт.
+      if (router.health?.get(router.keyOf(route)) === HEALTH.INVALID) continue;
+      const c = router.circuitOf(router.keyOf(route));
+      if (!c || c.state !== CIRCUIT.OPEN) continue; // ждём только разомкнутые
+      const reopenAt = Math.max((c.openedAt || 0) + cooldown, Number(c.retryAfterAt) || 0);
+      if (reopenAt < bestAt) {
+        bestAt = reopenAt;
+        best = route;
+      }
+    }
+    if (!best) return null;
+    const waitMs = bestAt - now;
+    const secs = Math.round(waitMs / 100) / 10;
+    if (waitMs > waitCap) {
+      ctx.logger?.info?.(
+        '[fallback-queue] all routes failed; %s/%s reopens in %ss > recoverWaitMs (%sms) — giving up',
+        best.provider, best.model, secs, waitCap,
+      );
+      return null;
+    }
+    ctx.logger?.info?.(
+      '[fallback-queue] all routes failed; waiting %ss for %s/%s to reopen',
+      secs, best.provider, best.model,
+    );
+    const deadline = Date.now() + Math.max(0, waitMs) + 50;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) return null;
+      await sleepTick(Math.min(250, deadline - Date.now()));
+    }
+    if (signal?.aborted) return null;
+    // Кулдаун истёк: переводим в «полуоткрыто». Успех попытки замкнёт маршрут,
+    // повторный отказ снова разомкнёт — решает реальный запрос, а не наш таймер.
+    router.isAvailable(best, Date.now());
+    return best;
+  }
+
   async function* runFallbackChain(options) {
     const sessionId = options?.sessionId ?? null;
     const full = buildFallbackChain(sessionId);
@@ -2429,107 +2506,128 @@ export function apply(ctx, pluginConfig = {}) {
     // 本轮已经试过几条：面板要用它说清「这一轮是第 6 条兜底答的，前面跳过了 5 条」，
     // 否则用户只能看到模型名还挂在 P1 上、以为 P1 在干活。
     let attempts = 0;
-    for (const route of chain) {
-      attempts += 1;
+    // Проходок максимум две: обычная и — если все живые маршруты отказали, а чей-то
+    // кулдаун истекает в пределах recoverWaitMs — одна повторная после ожидания.
+    // Инцидент 13.11 21:55: шаг упал «429 code 1310» от z.ai (квота до 17.11),
+    // хотя кулдаун DeepSeek истекал через минуту; ход был потерян целиком.
+    let round = 0;
+    let chainForRound = chain;
+    for (;;) {
+      for (const route of chainForRound) {
+        attempts += 1;
+        if (options?.signal?.aborted) {
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: '请求已取消' } } };
+          return;
+        }
+        // 面板「上一轮实际使用」要显示真正接管的这条真实路由，而不是虚拟的 fallback/auto。
+        const routeKey = router.keyOf(route);
+        const sm = router.sessionModelFor(sessionId);
+        const routeIdx = sm && sm.provider === route.provider && sm.model === route.model
+          ? -1
+          : (config.queue || []).findIndex((r) => router.keyOf(r) === routeKey);
+        const markRequest = (state, code) => {
+          // 实际发出去的是哪条，就把本会话的 inFlight 指到哪条：面板的「当前」在
+          // 请求进行中（还没有 ok 记录）也要显示这条，而不是回退到 selection=P1。
+          router.setInFlight(sessionId, routeIdx);
+          router.setLastRequest(sessionId, {
+            index: routeIdx,
+            provider: route.provider,
+            model: route.model,
+            session: sessionId,
+            at: Date.now(),
+            state,
+            code: code ?? null,
+            // 「前面还有几条没接住」：按整条链的位置算（含熔断被跳过、没真正试的），
+            // 这样面板说的「跳过 N 条」与用户看到的 P 编号对得上。
+            skipped: Math.max(0, full.indexOf(route)),
+            attempts,
+            settledAt: state === 'sent' ? null : Date.now(),
+          });
+          router.setPendingConfirm(sessionId, null);
+          router.touch();
+        };
+        markRequest('sent');
+        let sub;
+        try {
+          const subOpts = subCallOptions(options, route);
+          internalStreamOptions.add(subOpts);
+          sub = llm.stream(subOpts);
+        } catch (e) {
+          lastError = e;
+          router.recordFailure(route, e?.code || 'UNKNOWN', e?.message, null, e?.status);
+          markRequest('fail', e?.code || 'UNKNOWN');
+          continue;
+        }
+        let yieldedVisible = false;
+        let finished = false;
+        try {
+          for await (const chunk of sub) {
+            const isFinish = chunk?.type === 'finish';
+            const kind = chunk?.reason?.kind;
+            const failedFinish = isFinish && (kind === 'error' || kind === 'aborted');
+            if (!yieldedVisible && failedFinish) {
+              // 补上「多久之后再试」：上游把恢复时刻写在报文里，宿主读不到就只能按
+              // 本地退避重试 5 次，每次重试又把整链重新扫一遍（放大链长 × 6 倍）。
+              lastFailure = withRetryHint(chunk);
+              const f = lastFailure.reason?.failure || {};
+              router.recordFailure(route, f.code || 'UNKNOWN', f.message, f.providerRetryAfterMs, f.status);
+              markRequest('fail', f.code || 'UNKNOWN');
+              break; // 还没出内容 → 换下一条
+            }
+            if (!isFinish && chunk?.type && chunk.type !== 'usage') yieldedVisible = true;
+            yield chunk;
+            if (isFinish) {
+              finished = true;
+              if (!failedFinish) {
+                router.recordSuccess(route);
+                // 锚点：本轮哪条真正作答，下一轮就从哪条起跑（按会话隔离）。
+                router.setCursor(sessionId, routeIdx);
+                markRequest('ok');
+              }
+              return;
+            }
+          }
+        } catch (e) {
+          // 防御：adapterStream 本应把 adapter 异常转成 finish，但这里再兜一层。
+          lastError = e;
+          router.recordFailure(route, e?.code || 'UNKNOWN', e?.message, null, e?.status);
+          markRequest('fail', e?.code || 'UNKNOWN');
+          if (yieldedVisible) {
+            // 已吐过可见内容：不能换路（半截回答），但必须把错误终态交给下游，不能悄悄结束。
+            yield withRetryHint({
+              type: 'finish',
+              reason: { kind: 'error', failure: { code: e?.code || 'UNKNOWN', message: e?.message || '流中途失败' } },
+            });
+            finished = true;
+            return;
+          }
+        } finally {
+          if (!finished && typeof sub?.interrupt === 'function') {
+            try { await sub.interrupt(); } catch { /* ignore */ }
+          }
+        }
+        if (yieldedVisible) {
+          // 已吐内容后子流正常结束却没有 finish：补一个 stop 终态，避免下游挂起。
+          router.recordSuccess(route);
+          router.setCursor(sessionId, routeIdx);
+          markRequest('ok');
+          yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
+      }
+      // Дошли сюда — все живые маршруты этой проходки отказали. Прежде чем отдавать
+      // ошибку, даём шанс маршруту, который выйдет из кулдауна вот-вот.
+      if (!config.enabled || round >= 1) break;
+      const reopened = await waitForReopenedRoute(full, options?.signal);
       if (options?.signal?.aborted) {
         yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: '请求已取消' } } };
         return;
       }
-      // 面板「上一轮实际使用」要显示真正接管的这条真实路由，而不是虚拟的 fallback/auto。
-      const routeKey = router.keyOf(route);
-      const sm = router.sessionModelFor(sessionId);
-      const routeIdx = sm && sm.provider === route.provider && sm.model === route.model
-        ? -1
-        : (config.queue || []).findIndex((r) => router.keyOf(r) === routeKey);
-      const markRequest = (state, code) => {
-        // 实际发出去的是哪条，就把本会话的 inFlight 指到哪条：面板的「当前」在
-        // 请求进行中（还没有 ok 记录）也要显示这条，而不是回退到 selection=P1。
-        router.setInFlight(sessionId, routeIdx);
-        router.setLastRequest(sessionId, {
-          index: routeIdx,
-          provider: route.provider,
-          model: route.model,
-          session: sessionId,
-          at: Date.now(),
-          state,
-          code: code ?? null,
-          // 「前面还有几条没接住」：按整条链的位置算（含熔断被跳过、没真正试的），
-          // 这样面板说的「跳过 N 条」与用户看到的 P 编号对得上。
-          skipped: Math.max(0, full.indexOf(route)),
-          attempts,
-          settledAt: state === 'sent' ? null : Date.now(),
-        });
-        router.setPendingConfirm(sessionId, null);
-        router.touch();
-      };
-      markRequest('sent');
-      let sub;
-      try {
-        const subOpts = subCallOptions(options, route);
-        internalStreamOptions.add(subOpts);
-        sub = llm.stream(subOpts);
-      } catch (e) {
-        lastError = e;
-        router.recordFailure(route, e?.code || 'UNKNOWN', e?.message, null, e?.status);
-        markRequest('fail', e?.code || 'UNKNOWN');
-        continue;
-      }
-      let yieldedVisible = false;
-      let finished = false;
-      try {
-        for await (const chunk of sub) {
-          const isFinish = chunk?.type === 'finish';
-          const kind = chunk?.reason?.kind;
-          const failedFinish = isFinish && (kind === 'error' || kind === 'aborted');
-          if (!yieldedVisible && failedFinish) {
-            // 补上「多久之后再试」：上游把恢复时刻写在报文里，宿主读不到就只能按
-            // 本地退避重试 5 次，每次重试又把整链重新扫一遍（放大链长 × 6 倍）。
-            lastFailure = withRetryHint(chunk);
-            const f = lastFailure.reason?.failure || {};
-            router.recordFailure(route, f.code || 'UNKNOWN', f.message, f.providerRetryAfterMs, f.status);
-            markRequest('fail', f.code || 'UNKNOWN');
-            break; // 还没出内容 → 换下一条
-          }
-          if (!isFinish && chunk?.type && chunk.type !== 'usage') yieldedVisible = true;
-          yield chunk;
-          if (isFinish) {
-            finished = true;
-            if (!failedFinish) {
-              router.recordSuccess(route);
-              // 锚点：本轮哪条真正作答，下一轮就从哪条起跑（按会话隔离）。
-              router.setCursor(sessionId, routeIdx);
-              markRequest('ok');
-            }
-            return;
-          }
-        }
-      } catch (e) {
-        // 防御：adapterStream 本应把 adapter 异常转成 finish，但这里再兜一层。
-        lastError = e;
-        router.recordFailure(route, e?.code || 'UNKNOWN', e?.message, null, e?.status);
-        markRequest('fail', e?.code || 'UNKNOWN');
-        if (yieldedVisible) {
-          // 已吐过可见内容：不能换路（半截回答），但必须把错误终态交给下游，不能悄悄结束。
-          yield withRetryHint({
-            type: 'finish',
-            reason: { kind: 'error', failure: { code: e?.code || 'UNKNOWN', message: e?.message || '流中途失败' } },
-          });
-          finished = true;
-          return;
-        }
-      } finally {
-        if (!finished && typeof sub?.interrupt === 'function') {
-          try { await sub.interrupt(); } catch { /* ignore */ }
-        }
-      }
-      if (yieldedVisible) {
-        // 已吐内容后子流正常结束却没有 finish：补一个 stop 终态，避免下游挂起。
-        router.recordSuccess(route);
-        router.setCursor(sessionId, routeIdx);
-        markRequest('ok');
-        yield { type: 'finish', reason: { kind: 'stop' } };
-        return;
-      }
+      if (!reopened) break;
+      round += 1;
+      lastFailure = null;
+      lastError = null;
+      chainForRound = [reopened];
     }
     if (lastFailure) {
       yield lastFailure;
@@ -2610,6 +2708,7 @@ export const Config = s.object({
   immediateCodes: s.array(s.string()).default(DEFAULT_IMMEDIATE_CODES).description('命中即熔断的错误码').volatile(),
   failureThreshold: s.number().default(DEFAULT_CONFIG.failureThreshold).description('连续失败次数阈值（软熔断）').volatile(),
   cooldownMs: s.number().default(DEFAULT_CONFIG.cooldownMs).description('熔断冷却毫秒').volatile(),
+  recoverWaitMs: s.number().default(DEFAULT_CONFIG.recoverWaitMs).description('全部路由失败后等待重试的毫秒上限（0 = 不等待）').volatile(),
   failbackMode: s.union(['sticky', 'probe', 'manual']).default(DEFAULT_CONFIG.failbackMode).description('P1 恢复策略').volatile(),
   failbackDelayMs: s.number().default(DEFAULT_CONFIG.failbackDelayMs).description('探测回切防抖毫秒').volatile(),
   pingIntervalMs: s.number().default(DEFAULT_CONFIG.pingIntervalMs).description('周期全员 ping 间隔毫秒（0=关闭）').volatile(),

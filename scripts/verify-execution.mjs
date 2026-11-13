@@ -70,12 +70,32 @@ const BEHAVIOURS = {
   // 报错把恢复时刻写在**报文文本**里（适配层不会翻译成 providerRetryAfterMs）。
   // holdMs 在每次请求时动态算，固定时刻会过期，过期后断言就测不到东西了。
   hold: { kind: 'throttle-hold', holdMs: 180_000 },
+  // Квота с названной датой восстановления — ровно то, что 13.11.2026 отдал z.ai
+  // (code 1310). Дата в 2099, чтобы «до восстановления» гарантированно было далеко.
+  quota: {
+    kind: 'error',
+    code: 'RATE_LIMIT',
+    status: 429,
+    message: '429: {"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-11-17 22:05:10"}',
+  },
+  // Короткий лимит провайдера без retry-after: лечится кулдауном, а не датой.
+  rate: { kind: 'error', code: 'RATE_LIMIT', status: 429, message: '429: rate limit exceeded, retry later' },
+  // Первый вызов отказывает коротким лимитом, второй отвечает — этим проверяется,
+  // что после ожидания переоткрытия повторная попытка реально доходит до модели.
+  'flaky-once': { kind: 'flaky-once' },
 };
 function makeStream({ provider, model, maxTokens, messages, reasoningEffort, signal }, calls, reqs) {
   if (calls) calls.push(`${provider}/${model}`);
   // 完整请求留档：maxTokens / messages 这类"探测体形状"只能靠它验
   if (reqs) reqs.push({ provider, model, maxTokens, messages, reasoningEffort });
   let b = BEHAVIOURS[model] || { kind: 'content' };
+  if (b.kind === 'flaky-once') {
+    // Счётчик — по уже записанным вызовам: первый отказ, второй и далее ответ.
+    const seen = calls ? calls.filter((c) => c === `${provider}/${model}`).length : 1;
+    b = seen > 1
+      ? { kind: 'content' }
+      : { kind: 'error', code: 'RATE_LIMIT', status: 429, message: '429: rate limit exceeded, retry later' };
+  }
   if (b.kind === 'min-tokens') {
     b = (Number(maxTokens) || 0) < b.min
       ? { kind: 'error', code: 'INVALID_REQUEST', message: `max_tokens must be >= ${b.min}`, status: 400 }
@@ -133,7 +153,9 @@ function makeLlm() {
 
 // ---- 假宿主 ----
 function makeCtx(settingsValue, injectedLlm) {
-  const doc = { ns: 'dsh-model-fallback-queue', revision: 1, value: { ...settingsValue } };
+  // recoverWaitMs: 0 по умолчанию в тестах — старая семантика «все отказали → ошибка»
+  // остаётся закреплённой; ожидание переоткрытия проверяется отдельным сценарием K.
+  const doc = { ns: 'dsh-model-fallback-queue', revision: 1, value: { recoverWaitMs: 0, ...settingsValue } };
   const events = [];
   // 钩子表：agent/request 与 agent/request-error 的瀑布必须能被真实调用，
   // 否则"覆盖路由时剥档位"这种逻辑只能靠读源码断言——那测不到真实流程。
@@ -1154,6 +1176,77 @@ ok('index.js 可被真实 import', typeof mod.apply === 'function');
     ok('H-3: без инструментов переход на другого провайдера работает',
       wllm.calls[0] === 'zai/auth' && wllm.calls[1] === 'deepseek-official/good', wllm.calls.join(','));
     ok('H-3: уровень не наследуется, thinking включён', wllm.reqs[1]?.reasoningEffort === undefined);
+  }
+}
+
+// ================= 场景 K：все маршруты отказали — дождаться переоткрытия =================
+// Инцидент 13.11.2026 21:55 (сессия soma session-0b35bf9c): шаг упал «429 code 1310
+// Weekly/Monthly Limit Exhausted … reset 2026-11-17 22:05:10» от z.ai, хотя
+// P1 = deepseek-official. Плагин проходил цепочку ОДИН раз: P1 дал короткий 429,
+// P2 — квоту до даты, цепочка кончилась, и весь ход погиб, хотя кулдаун P1 истекал
+// через минуту. Теперь плагин ждёт ближайшее переоткрытие в пределах recoverWaitMs
+// и повторяет тот же ход один раз.
+{
+  // Один прогон «настоящего» шага: свежий ctx, очередь, собранный поток.
+  const drive = async (settings, queue, sessionId) => {
+    const l = makeLlm();
+    const { ctx, hooks } = makeCtx({ enabled: true, pingIntervalMs: 0, p1Follow: false, ...settings }, l);
+    mod.apply(ctx, { enabled: true });
+    await new Promise((r) => setTimeout(r, 80));
+    const svc = ctx.__service;
+    if (!svc || typeof hooks['llm/stream'] !== 'function') return { skipped: true };
+    await svc.setQueue(queue);
+    l.calls.length = 0;
+    const options = {
+      sessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      maxTokens: 16,
+    };
+    const t0 = Date.now();
+    const chunks = [];
+    for await (const c of hooks['llm/stream'](options, () => l.stream(options))) chunks.push(c);
+    return { chunks, calls: l.calls, ms: Date.now() - t0 };
+  };
+
+  // —— K-1: P1 отдал короткий лимит, резерв — «квота до даты» → ждём P1, ход живёт ——
+  const k1 = await drive(
+    { cooldownMs: 80, recoverWaitMs: 600 },
+    [
+      { provider: 'p', model: 'flaky-once' },
+      { provider: 'p', model: 'quota' },
+    ],
+    'recover-1',
+  );
+  if (!k1.skipped) {
+    ok('K-1: после отказа резерва по квоте — повтор P1, а не конец хода',
+      k1.calls.join(',') === 'p/flaky-once,p/quota,p/flaky-once', k1.calls.join(','));
+    ok('K-1: ход завершился ответом, а не ошибкой 429',
+      k1.chunks.some((c) => c.type === 'text-delta')
+        && k1.chunks.at(-1)?.type === 'finish' && k1.chunks.at(-1)?.reason?.kind === 'stop',
+      JSON.stringify(k1.chunks.at(-1)));
+    ok('K-1: ожидание действительно было (не мгновенный повтор)', k1.ms >= 70, `${k1.ms}ms`);
+  }
+
+  // —— K-2: переоткрыться в пределах потолка некому → прежняя ошибка, без ожидания ——
+  const k2 = await drive(
+    { cooldownMs: 5_000, recoverWaitMs: 100 },
+    [
+      { provider: 'p', model: 'rate' },
+      { provider: 'p', model: 'quota' },
+    ],
+    'recover-2',
+  );
+  if (!k2.skipped) {
+    ok('K-2: дальний кулдаун не ждём — каждая маршрутка пробуется один раз',
+      k2.calls.join(',') === 'p/rate,p/quota', k2.calls.join(','));
+    ok('K-2: наружу уходит прежняя ошибка последней маршрутки (квота)',
+      k2.chunks.length === 1 && k2.chunks[0]?.reason?.kind === 'error'
+        && /Weekly\/Monthly Limit Exhausted/.test(k2.chunks[0]?.reason?.failure?.message || ''),
+      JSON.stringify(k2.chunks.at(-1)));
+    ok('K-2: подсказка «когда вернуться» сохранена (хост не будет долбить)',
+      Number(k2.chunks[0]?.reason?.failure?.providerRetryAfterMs) > 0,
+      String(k2.chunks[0]?.reason?.failure?.providerRetryAfterMs));
+    ok('K-2: ожидания не было', k2.ms < 1_000, `${k2.ms}ms`);
   }
 }
 
